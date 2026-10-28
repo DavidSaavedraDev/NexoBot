@@ -1,0 +1,1 @@
+"""NexoBot backend package."""
