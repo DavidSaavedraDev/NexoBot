@@ -18,7 +18,7 @@ OpenAI. OpenAI, frontend y autenticación no forman parte de esta fase.
 
 ```text
 backend/
-├── main.py                 # Aplicación FastAPI, lifespan y middleware
+├── main.py                 # Aplicación Flask y webhook de Meta
 ├── api/                    # Webhook de WhatsApp y endpoints administrativos
 ├── config/                 # Configuración tipada desde variables de entorno
 ├── database/               # Sesiones, base declarativa y datos demo
@@ -101,54 +101,26 @@ restricción única de `messages.whatsapp_message_id`.
 
 ## Datos demo y ejecución
 
-El script prepara la base, ejecuta migraciones, inserta un negocio, cinco
-clientes, cinco conversaciones y mensajes de ejemplo, y verifica `/health`:
+Para arrancar el servidor Flask desde la raíz:
 
 ```powershell
-python scripts/setup_dev.py
-uvicorn backend.main:app --reload
+python -m backend.main
 ```
 
 Endpoints:
 
 - `GET /health`
 - `GET /webhook` para la verificación de Meta
-- `POST /webhook` para mensajes Cloud API
-- `GET /api/customers?page=1&page_size=20`
-- `GET /api/conversations?page=1&page_size=20`
-- `GET /api/messages?page=1&page_size=20`
-- `GET /api/business` (requiere `X-API-Key`)
-- `PUT /api/business` (requiere `X-API-Key`)
-- `POST /api/demo/message` para simular mensajes localmente sin HMAC ni Meta
-- Swagger: `http://127.0.0.1:8000/docs`
-- Diagnóstico WhatsApp: `GET /api/debug/whatsapp`
+- `POST /webhook` para mensajes de WhatsApp Cloud API
 
-Los endpoints administrativos requieren el header `X-API-Key` con el valor de
-`ADMIN_API_KEY`. El endpoint local de demo no requiere API key porque está
-destinado exclusivamente al desarrollo local; no debe exponerse públicamente.
-
-### Demostración local
-
-Con la aplicación ejecutándose, abre Swagger en
-`http://127.0.0.1:8000/docs`, selecciona `POST /api/demo/message` y envía:
-
-```json
-{
-  "phone": "573001112233",
-  "name": "Carlos",
-  "message": "hola"
-}
-```
-
-La respuesta se genera con la misma lógica del webhook real y se guardan el
-cliente, la conversación, el mensaje entrante y el mensaje saliente. La ruta
-local no llama a Meta, por lo que funciona aunque WhatsApp Cloud API esté
-deshabilitado o todavía no tenga credenciales reales.
+Para limitar las respuestas a números autorizados, configura
+`WHATSAPP_ALLOWED_FROM` como una lista separada por comas, sin `+`. Déjala
+vacía para aceptar cualquier remitente de prueba autorizado por Meta.
 
 Para pruebas locales con Ngrok:
 
 ```powershell
-ngrok http 8000
+ngrok http 5000
 ```
 
 Configura en Meta `https://<dominio-ngrok>/webhook` y el mismo

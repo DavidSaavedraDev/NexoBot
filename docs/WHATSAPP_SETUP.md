@@ -63,6 +63,8 @@ WHATSAPP_ACCESS_TOKEN=token-temporal-de-meta
 WHATSAPP_PHONE_NUMBER_ID=123456789012345
 WHATSAPP_VERIFY_TOKEN=un-secreto-largo-generado-por-ti
 WHATSAPP_API_VERSION=v21.0
+WHATSAPP_REPLY_TEXT=¡Hola! Recibí tu mensaje correctamente.
+WHATSAPP_ALLOWED_FROM=17119407164
 WHATSAPP_ENABLED=true
 ```
 
@@ -95,14 +97,13 @@ En producción usa un secret manager y rota el token si se expone.
 Desde la raíz del proyecto:
 
 ```powershell
-python -m alembic upgrade head
-uvicorn backend.main:app --host 0.0.0.0 --port 8000
+python -m backend.main
 ```
 
 Comprueba:
 
 ```powershell
-Invoke-WebRequest http://127.0.0.1:8000/health
+Invoke-WebRequest http://127.0.0.1:5000/health
 ```
 
 ### 5.2 Exponerlo con ngrok
@@ -110,7 +111,7 @@ Invoke-WebRequest http://127.0.0.1:8000/health
 En otra terminal:
 
 ```powershell
-ngrok http 8000
+ngrok http 5000
 ```
 
 Usa la URL HTTPS que muestra ngrok, por ejemplo:
@@ -140,34 +141,63 @@ Meta hará una solicitud GET con `hub.mode`, `hub.challenge` y
 
 ## 6. Diagnóstico seguro
 
-Consulta:
-
-```text
-GET /api/debug/whatsapp
-```
-
-Ejemplo con `curl`:
+Comprueba que el servidor está activo:
 
 ```powershell
-curl http://127.0.0.1:8000/api/debug/whatsapp
+Invoke-WebRequest http://127.0.0.1:5000/health
 ```
 
-El endpoint informa:
-
-- si WhatsApp está habilitado;
-- si están configuradas las variables;
-- versión Graph API;
-- si el Phone Number ID y token están presentes;
-- si el token fue aceptado por Graph API;
-- estado de conexión;
-- tiempo de respuesta.
-
-Nunca devuelve el token ni el valor del verify token. Con
-`WHATSAPP_ENABLED=false` no realiza llamadas externas y devuelve estado
-`disabled`. Si faltan credenciales con el servicio habilitado, devuelve
-`invalid_configuration` sin enviar mensajes.
+Revisa la terminal donde ejecutas NexoBot. Debes ver el POST recibido y,
+cuando el remitente está permitido, `Respuesta enviada por WhatsApp`.
+`WHATSAPP_ENABLED=false` evita cualquier llamada a Graph API. Para restringir
+los remitentes, usa `WHATSAPP_ALLOWED_FROM=17119407164` o una lista separada
+por comas; déjala vacía para permitir cualquier número de prueba autorizado
+por Meta.
 
 ## 7. Prueba end-to-end
+
+### Prueba simulada local
+
+Con Flask ejecutándose en otra terminal, envía un payload con la misma
+estructura que Meta:
+
+```powershell
+python scripts/test_webhook.py http://127.0.0.1:5000/webhook 5215551234567
+```
+
+El segundo argumento es el remitente simulado. Debe coincidir con
+`WHATSAPP_ALLOWED_FROM` si configuraste una allowlist. El script genera un
+`message_id` nuevo en cada ejecución y firma el payload automáticamente si
+`WHATSAPP_APP_SECRET` está configurado.
+
+La respuesta esperada del script es:
+
+```text
+HTTP 200
+EVENT_RECEIVED
+```
+
+Con `WHATSAPP_ENABLED=false`, la terminal de Flask debe mostrar:
+
+```text
+POST /webhook recibido
+Payload JSON recibido
+Mensajes de texto extraídos: 1
+Mensaje de texto recibido
+WhatsApp deshabilitado; no se enviará respuesta
+POST /webhook procesado; devolviendo EVENT_RECEIVED con HTTP 200
+```
+
+Para comprobar también el envío real a Graph API, configura las credenciales
+válidas y `WHATSAPP_ENABLED=true` antes de iniciar Flask. En ese caso, el log
+final debe ser:
+
+```text
+Respuesta enviada por WhatsApp
+```
+
+Si Graph rechaza el mensaje, aparecerá `Graph API rechazó el mensaje` junto con
+el código HTTP y el detalle devuelto por Meta.
 
 ### Caso 1: saludo
 
@@ -240,7 +270,7 @@ Eventos principales:
 - `Mensaje entrante registrado`.
 - `Mensaje enviado por WhatsApp`.
 - `Error API Meta al enviar mensaje`.
-- `Error API Meta durante diagnóstico`.
+- `Remitente no autorizado; no se enviará respuesta`.
 
 No se registra el access token ni el contenido de headers de autorización.
 
@@ -257,14 +287,11 @@ No se registra el access token ni el contenido de headers de autorización.
 - [ ] `WHATSAPP_ACCESS_TOKEN` almacenado como secreto.
 - [ ] `WHATSAPP_ENABLED=true`.
 - [ ] `WHATSAPP_API_VERSION` soportada por la cuenta.
-- [ ] Migraciones ejecutadas.
 - [ ] Servicio accesible por HTTPS.
 - [ ] Webhook `/webhook` verificado en Meta.
 - [ ] Campo `messages` suscrito.
-- [ ] `GET /api/debug/whatsapp` devuelve `connected`.
-- [ ] Casos manuales de saludo, horario, precio y desconocido validados.
+- [ ] Se recibió un mensaje del número autorizado y se envió la respuesta.
 - [ ] Logs no contienen tokens.
-- [ ] Endpoint administrativo protegido antes de publicar el servicio.
 - [ ] ngrok sustituido por dominio y TLS de producción.
 
 ## 10. Solución de problemas
@@ -274,27 +301,24 @@ No se registra el access token ni el contenido de headers de autorización.
 - Confirma que la URL termina en `/webhook`.
 - Confirma que es HTTPS y está accesible desde Internet.
 - Confirma que el token coincide exactamente.
-- Revisa que el proceso Uvicorn y ngrok sigan activos.
+- Revisa que el proceso Flask y ngrok sigan activos.
 - Observa los logs de ngrok y la respuesta GET.
 
-### `invalid_configuration`
+### No se envía la respuesta
 
-Comprueba las cinco variables y especialmente:
+Comprueba estas variables:
 
 - `WHATSAPP_ENABLED=true`;
 - `WHATSAPP_ACCESS_TOKEN` no vacío;
 - `WHATSAPP_PHONE_NUMBER_ID` correcto;
 - `WHATSAPP_VERIFY_TOKEN` configurado;
-- `WHATSAPP_API_VERSION` con formato como `v21.0`.
+- `WHATSAPP_API_VERSION` con formato como `v21.0`;
+- `WHATSAPP_ALLOWED_FROM` contiene el número del remitente sin `+`, o está
+  vacío.
 
-### `unavailable` o `token_valid=false`
-
-- El token puede estar expirado o revocado.
-- El token puede no tener permisos para la WABA.
-- El Phone Number ID puede pertenecer a otra aplicación.
-- Puede existir un problema de red, DNS o rate limit.
-- Ejecuta de nuevo el diagnóstico y consulta el código HTTP de Meta en los
-  logs sin revelar el token.
+Si el log muestra un error de Graph API, el token puede estar expirado o no
+tener permisos para la WABA; revisa también que el Phone Number ID sea el de
+la aplicación correcta.
 
 ### El mensaje entra, pero no sale
 

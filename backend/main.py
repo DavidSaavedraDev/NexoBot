@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -86,8 +87,39 @@ app = Flask(__name__)
 
 
 def _verification_token() -> str:
-    """Token temporal para pruebas locales."""
-    return "mi_token_secreto_123"
+    """Obtiene el token que debe coincidir con el configurado en Meta."""
+    return os.getenv("WHATSAPP_VERIFY_TOKEN", "").strip()
+
+
+def _whatsapp_is_enabled() -> bool:
+    return os.getenv("WHATSAPP_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _is_authorized_sender(sender_id: str) -> bool:
+    """Aplica una allowlist opcional de números en formato internacional."""
+    allowed = os.getenv("WHATSAPP_ALLOWED_FROM", "").strip()
+    if not allowed:
+        return True
+    authorized = {
+        value.strip().lstrip("+")
+        for value in allowed.split(",")
+        if value.strip()
+    }
+    return sender_id.lstrip("+") in authorized
+
+
+def _payload_debug_enabled() -> bool:
+    return os.getenv("WHATSAPP_DEBUG_PAYLOAD", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _valid_signature(raw_body: bytes) -> bool:
@@ -137,20 +169,51 @@ def _text_message(
 
 def _parse_whatsapp(payload: dict[str, Any]) -> Iterator[IncomingMessage]:
     """Extrae messages[].text.body de entry[].changes[].value de WhatsApp."""
-    for entry in payload.get("entry", []):
+    entries = payload.get("entry")
+    if not isinstance(entries, list):
+        logger.warning("Payload WhatsApp sin entry[] válido")
+        return
+
+    for entry in entries:
         if not isinstance(entry, dict):
+            logger.warning("Payload WhatsApp contiene una entry inválida")
             continue
-        for change in entry.get("changes", []):
+        changes = entry.get("changes")
+        if not isinstance(changes, list):
+            logger.warning("Payload WhatsApp sin changes[] válido")
+            continue
+        for change in changes:
             if not isinstance(change, dict):
+                logger.warning("Payload WhatsApp contiene un change inválido")
+                continue
+            if change.get("field") != "messages":
+                logger.debug("Cambio WhatsApp ignorado: field=%r", change.get("field"))
                 continue
             value = change.get("value")
             if not isinstance(value, dict):
+                logger.warning("Payload WhatsApp sin value válido")
                 continue
-            for message in value.get("messages", []):
+            messages = value.get("messages")
+            if not isinstance(messages, list):
+                logger.debug("Evento WhatsApp sin messages[]; probablemente status")
+                continue
+            for message in messages:
                 if not isinstance(message, dict):
+                    logger.warning("Payload WhatsApp contiene un message inválido")
+                    continue
+                if message.get("type") != "text":
+                    logger.info(
+                        "Mensaje WhatsApp ignorado por tipo no textual: %r",
+                        message.get("type"),
+                    )
                     continue
                 text = message.get("text")
-                if not isinstance(text, dict):
+                if (
+                    not isinstance(text, dict)
+                    or not isinstance(text.get("body"), str)
+                    or not text["body"].strip()
+                ):
+                    logger.warning("Mensaje WhatsApp sin text.body válido")
                     continue
                 parsed = _text_message(
                     message.get("from"),
@@ -186,10 +249,12 @@ def _parse_instagram(payload: dict[str, Any]) -> Iterator[IncomingMessage]:
 
 def parse_meta_messages(payload: dict[str, Any]) -> list[IncomingMessage]:
     """Identifica la plataforma y normaliza solo mensajes de texto."""
-    if payload.get("object") == "whatsapp_business_account":
+    payload_object = payload.get("object")
+    if payload_object == "whatsapp_business_account":
         return list(_parse_whatsapp(payload))
-    if payload.get("object") == "instagram":
+    if payload_object == "instagram":
         return list(_parse_instagram(payload))
+    logger.warning("Evento Meta ignorado por object desconocido: %r", payload_object)
     return []
 
 
@@ -238,13 +303,15 @@ def process_bot_response(message: IncomingMessage) -> None:
             "content": message.content,
         },
     )
-    if message.platform == "whatsapp":
+    if message.platform == "whatsapp" and _is_authorized_sender(message.sender_id):
         send_whatsapp_text(
             recipient=message.sender_id,
             text=os.getenv(
                 "WHATSAPP_REPLY_TEXT", "¡Hola! Recibí tu mensaje correctamente."
             ),
         )
+    elif message.platform == "whatsapp":
+        logger.warning("Remitente no autorizado; no se enviará respuesta")
 
 
 def send_whatsapp_text(recipient: str, text: str) -> bool:
@@ -253,6 +320,10 @@ def send_whatsapp_text(recipient: str, text: str) -> bool:
     El token de acceso y el Phone Number ID se leen desde el entorno:
     ``WHATSAPP_ACCESS_TOKEN`` y ``WHATSAPP_PHONE_NUMBER_ID``.
     """
+    if not _whatsapp_is_enabled():
+        logger.info("WhatsApp deshabilitado; no se enviará respuesta")
+        return False
+
     access_token = os.getenv("WHATSAPP_ACCESS_TOKEN", "").strip()
     phone_number_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID", "").strip()
     api_version = os.getenv("WHATSAPP_API_VERSION", "v21.0").strip()
@@ -282,8 +353,15 @@ def send_whatsapp_text(recipient: str, text: str) -> bool:
             timeout=10,
         )
         response.raise_for_status()
+    except requests.HTTPError as error:
+        logger.error(
+            "Graph API rechazó el mensaje: status=%s body=%s",
+            error.response.status_code if error.response is not None else "unknown",
+            error.response.text[:1000] if error.response is not None else "",
+        )
+        return False
     except requests.RequestException:
-        logger.exception("Error enviando respuesta por WhatsApp Cloud API")
+        logger.exception("Error de red enviando respuesta por WhatsApp Cloud API")
         return False
 
     logger.info("Respuesta enviada por WhatsApp", extra={"recipient": recipient})
@@ -350,6 +428,11 @@ def receive_webhook() -> Response:
             logger.info("POST /webhook sin payload válido; devolviendo HTTP 200")
             return Response("EVENT_RECEIVED", status=200, mimetype="text/plain")
 
+        if _payload_debug_enabled():
+            logger.info(
+                "Payload JSON completo recibido: %s",
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            )
         logger.info(
             "Payload JSON recibido",
             extra={
